@@ -25,25 +25,31 @@ When failures happen, though, CockroachDB automatically realizes nodes have stop
 In relationship to other layers in CockroachDB, the Replication Layer:
 
 - Receives requests from and sends responses to the Distribution Layer.
-- Writes accepted requests to the Storage Layer.
+- Writes accepted requests to and reads values from the Storage Layer.
 
 ## Components
 
 ### Raft
 
-Raft is a consensus protocol––an algorithm which makes sure that your data is safely stored on multiple machines, and that those machines agree on the current state even if some of them are temporarily disconnected.
+Raft is a consensus protocol––an algorithm which makes sure that a quorum of machines agree on the current state of your data, even if some of them are temporarily disconnected.
 
-Raft organizes all nodes that contain a replica of a range into a group--unsurprisingly called a Raft Group. Each replica in a Raft Group is either a "leader" or a "follower". The leader, which is elected by Raft and long-lived, coordinates all writes to the Raft Group. It heartbeats followers periodically and keeps their logs replicated. In the absence of heartbeats, followers become candidates after randomized election timeouts and proceed to hold new leader elections.
-
-Once a node receives a `BatchRequest` for a range it contains, it converts those KV operations into Raft commands. Those commands are proposed to the Raft group leader––which is what makes it ideal for the [Leaseholder](#leases) and the Raft leader to be one in the same––and written to the Raft log.
+Raft organizes all nodes that contain a replica of a range into a group--unsurprisingly called a Raft Group. Each replica in a Raft Group is either a "leader" or a "follower". The leader, which is elected by Raft and long-lived, coordinates all writes to the Raft Group. It heartbeats followers periodically and keeps their logs replicated. In the absence of heartbeats, followers become candidates after randomized election timeouts and proceed hold new leader elections.
 
 For a great overview of Raft, we recommend [The Secret Lives of Data](http://thesecretlivesofdata.com/raft/).
+
+#### Leases in Raft
+
+One of the members of the Raft group is elected to be the range's Leaseholder, which means that all requests for the range are forwarded to it––both reads and writes. It's important to note that this does not *have* to be the same member as the Raft leader, though it's beneficial for them to be collocate and, if CockroachDB detects that they are not, attempts to collocate both the Leaseholder and the Raft leader on the same node.
+
+We have more detail on Leases here.
+
+When the Leaseholder receives writes in `BatchRequests` from the [Distribution Layer](distribution-layer.html#batchrequest), it converts the contained KV operations into Raft commands. Those commands are proposed to the Raft group leader––which is what makes it ideal for the Leaseholder and the Raft leader to be one in the same––and written to the Raft log.
 
 #### Raft Logs
 
 When writes receive a quorum, and are committed by the Raft group leader, they're appended to the Raft log. This provides an ordered set of commands that the replicas agreed on and is essentially the source of truth for consistent replication.
 
-Because this log is treated as serializable, it can be replayed to bring a node from a past state to its current state. This log also lets nodes that temporarily went offline to be "caught up" to the current state without needing to receive a copy of the existing data in the form of a snapshot.
+Because this log is treated as serializable, it can be replayed to bring a node from a past state to the same current state as the rest of the Raft group. This log also lets nodes that temporarily went offline to be "caught up" to the current state without needing to receive a copy of the existing data in the form of a snapshot.
 
 ### Snapshots
 
@@ -55,9 +61,7 @@ After loading the snapshot, the node gets up to date by replaying all actions fr
 
 A single node in the Raft group acts as the Leaseholder, which is the only node that can serve reads or propose writes to the Raft group leader (both actions are received as `BatchRequests` from [`DistSender`](distribution-layer.html#distsender)).
 
-When serving reads, Leaseholders bypass Raft; for the Leaseholder's writes to have been committed in the first place, they must have already achieved consensus, so a second consensus on the same data is unnecessary. This has the benefit of not incurring networking round trips required by Raft and greatly increases the speed of reads (without sacrificing consistency).
-
-CockroachDB attempts to elect a Leaseholder who is also the Raft group leader, which can also optimize the speed of writes.
+When serving reads, Leaseholders bypass Raft; all of the Leaseholder's writes must have already achieved quorum, so a second consensus on the same data is unnecessary. This skips the networking round trips required by Raft and greatly increases the speed of reads (without sacrificing consistency).
 
 If there is no Leaseholder, any node receiving a request will attempt to become the Leaseholder for the range. To prevent two nodes from acquiring the lease, the requester includes a copy of the last valid lease it had; if another node became the Leaseholder, its request is ignored.
 
@@ -101,7 +105,7 @@ The Replication layer sends `BatchResponses` back to the Distribution Layer's `D
 
 ### Replication & Storage Layers
 
-Committed Raft commands are written to the Raft log and ultimately stored on disk through the Storage Layer.
+Committed Raft commands are written to the Raft log, which has its own store in the Storage Layer's instance of RocksDB.
 
 The Leaseholder serves reads from its RocksDB instance, which is in the Storage Layer.
 
